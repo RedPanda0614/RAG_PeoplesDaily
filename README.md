@@ -1,10 +1,12 @@
-# 人民日报问答系统实现报告
+# RAG system design on People’s Daily corpus
 
-## 1 获得数据
+## 1 Data collecting
 
-使用python爬虫抓取2023.5-2024.4人民日报的全部文章。参考project：https://github.com/858399075/pachong
+Use Python web scraping to collect all articles from People’s Daily between May 2023 and April 2024.
+Refer to the project: https://github.com/858399075/pachong.
 
-保存为json格式方便读取。样例如下：
+Save the data in JSON format for easier reading.
+An example format is shown below:
 
 ```json
 [
@@ -17,9 +19,13 @@
  ]
 ```
 
-## 2 数据预处理
+## 2 Data processing
 
-观察得到的数据，发现存在：1. 纯图报道无文字；2. “本版责编”页与“x月责编”页，均没有有效信息，把这些新闻全部删除。
+Upon examining the collected data, the following issues were found:
+	1.	Some reports contain only images without any text.
+	2.	Pages such as “Editor of this page” and “Editor of month X” do not contain valid information.
+
+All such news items should be removed.
 
 ```python
 def clean_json_files(directory):
@@ -37,19 +43,23 @@ def clean_json_files(directory):
                 json.dump(cleaned_data, file, ensure_ascii=False, indent=4)
 ```
 
-## 3 构建文档检索模型
+## 3 Document Retrieval Model Construction
 
-这一步先后尝试了基础的BM25与使用bert-based的dense retrieval。预训练模型先后尝试了bert-base-chinese和sbert-base-chinese-nli，但检索的效果均不如最基础的bm25，因此最终还是选择了bm25作为检索模型。
+In this stage, both traditional and neural retrieval approaches were explored. Specifically, I experimented with the classical BM25 algorithm as well as dense retrieval methods based on BERT. Two pretrained models, bert-base-chinese and sbert-base-chinese-nli, were evaluated. However, the performance of these dense retrieval models was consistently inferior to the baseline BM25. Consequently, BM25 was adopted as the final retrieval model.
 
-又为了提升检索效果，我对于文章的标题和内容分别构建了corpus，训练了两个BM25模型让其进行分级检索，取top2个最相关标题的文章与top5最相关内容的文章的并集，得到最终选定的新闻内容。
+To enhance retrieval effectiveness, separate corpora were constructed for article titles and article contents. Two BM25 models were trained accordingly, and a hierarchical retrieval strategy was employed: the union of the top 2 most relevant results based on titles and the top 5 most relevant results based on contents was selected as the final set of retrieved documents.
 
-这一步还涉及到简单的query处理：遇到两个不同方向的query，比如读书日和海洋共同体，召回效果也很差。考虑在第一步拆分query，可以按照逗号划分，也可以直接丢给大模型让他自己处理，分别进行搜索。进行各种尝试后发现大模型拆分的query过于冗长，于是决定直接按逗号分隔。
+In addition, basic query preprocessing was introduced. When queries contained multiple, semantically divergent components (e.g., Reading Day and Maritime Community), recall performance deteriorated significantly. To address this, query splitting was considered. Two approaches were tested: (1) splitting queries by commas, and (2) delegating query decomposition to a large language model (LLM). Empirical results showed that LLM-generated sub-queries tended to be unnecessarily verbose, whereas comma-based splitting yielded more efficient results. Therefore, the latter approach was adopted.
 
-## 4 文档内重排序
+## 4 Re-ranking
 
-接下来考虑更细粒度的查询：返回召回的新闻时，能否先找到最相关的段落？给大模型的内容能不能缩减至一定长度。（比如512个字）。因此对返回的前k个文章内容要再做一些处理。
+The next step focuses on finer-grained query matching: when returning retrieved news articles, can the system first identify the most relevant paragraphs? Moreover, can the content provided to the LLM be reduced to a manageable length (e.g., 512 characters)? To address these questions, additional processing was applied to the top-k retrieved articles.
 
-这一步使用了gte文本嵌入模型（https://modelscope.cn/models/iic/nlp_gte_sentence-embedding_chinese-base/summary）。按段落划分文章，对于query和每一段文章进行向量化，进而计算query与文本每一段的相似度。通过相似度来对每个段落进行重排序，每个文档取前k个段落作为最终的内容，考虑到模型输入token限制，要求k个段落的字数加起来不超过1024.最终，将精简后的文本一起作为input输入给文本生成模型。
+For this step, I employed the **GTE sentence embedding model** (https://modelscope.cn/models/iic/nlp_gte_sentence-embedding_chinese-base/summary). 
+
+Each article was divided into paragraphs, and both the query and each paragraph were vectorized using the embedding model. The similarity between the query and each paragraph was then computed. Based on these similarity scores, paragraphs were re-ranked, and the top-k paragraphs from each document were selected as the final content.
+
+Considering the token length limitations of downstream models, the total length of the selected paragraphs was constrained to no more than 1,024 characters. Finally, the condensed text was aggregated and fed into the text generation model as input.
 
 ```python
 def simplify_text(text, query, max_length):
@@ -78,13 +88,13 @@ def simplify_text(text, query, max_length):
 
 
 
-## 5 文本生成模型
+## 5 Generation
 
-此处模型最开始尝试使用llama-3-chinese-8b-instruct，但奈何没有合适的数据集进行微调，导致回答效果很差，最终弃用。
+nitially, I experimented with the **LLaMA-3-Chinese-8B-Instruct** model. However, due to the lack of a suitable dataset for fine-tuning, the model’s response quality was unsatisfactory, and it was eventually discarded.
 
-最后选择比较聪明的gpt-4-turbo（调用openai的api-key实现）。
+As a replacement, I adopted **GPT-4-Turbo**, accessed via the OpenAI API, which demonstrated significantly better reasoning and generation capabilities.
 
-最后在测试集上能够达到em=0.9
+On the test set, this approach achieved an **Exact Match (EM) score of 0.9**, indicating strong retrieval and answer generation performance.
 
 ---------
 
@@ -179,14 +189,16 @@ def answer_question(question, context):
         return "抱歉，我无法回答这个问题。"
 ~~~
 
-拆分query效果：
-![image-20240603171302789](/Users/redpanda/Library/Application Support/typora-user-images/image-20240603171302789.png)
 
-回答效果：
-![image-20240603171612678](/Users/redpanda/Library/Application Support/typora-user-images/image-20240603171612678.png)
+## 6 Result
+query spliting:
+<img width="774" height="123" alt="image" src="https://github.com/user-attachments/assets/a8355636-bfd9-4f7b-9d7d-1d4e1e671223" />
 
-## 6 最终结果
+answer：
+<img width="770" height="423" alt="image" src="https://github.com/user-attachments/assets/1555209b-8d06-447f-9283-4914aaffd308" />
 
-在评测问题上的EM=0.7625
 
-![image-20240603163755377](/Users/redpanda/Library/Application Support/typora-user-images/image-20240603163755377.png)
+
+EM=0.7625 on eval set:
+<img width="750" height="123" alt="image" src="https://github.com/user-attachments/assets/4c1ca91c-69c5-49d3-957b-0550adc20b48" />
+
